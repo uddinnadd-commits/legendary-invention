@@ -1,0 +1,119 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Don't pile up runs on rapid pushes
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Pinned image: not "ubuntu-latest", so a new Ubuntu release never changes your build.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The run stays green even if the build step fails.
+    continue-on-error: true
+
+    env:
+      # No apt-get / OS package updates anywhere in this workflow; we only use what the runner image ships.
+      DEBIAN_FRONTEND: noninteractive
+      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.warning.mode=none
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Locate the Gradle project (repo root, a subfolder, or an un-extracted zip)
+        id: locate
+        shell: bash
+        run: |
+          find_settings() {
+            find . -maxdepth 5 \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -not -path './.git/*' | head -n 1
+          }
+          f=$(find_settings)
+          if [ -z "$f" ]; then
+            echo "No settings.gradle found. Looking for zip files to extract..."
+            i=0
+            while IFS= read -r z; do
+              i=$((i+1))
+              echo "Extracting $z"
+              unzip -o -q "$z" -d "_unzipped_$i" || true
+            done < <(find . -maxdepth 4 -name '*.zip' -not -path './.git/*' -not -path './_unzipped_*')
+            f=$(find_settings)
+          fi
+          if [ -z "$f" ]; then
+            echo "Still no settings.gradle. Repo contents:"
+            find . -maxdepth 3 -not -path './.git/*' | head -100
+            echo "dir=." >> "$GITHUB_OUTPUT"
+          else
+            echo "Found Gradle project at: $(dirname "$f")"
+            echo "dir=$(dirname "$f")" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Java 25 (pinned, no auto-upgrade)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          check-latest: false
+
+      - name: Set up Gradle 9.5.1 (pinned)
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: '9.5.1'
+
+      - name: Build (errors are ignored; log is saved)
+        continue-on-error: true
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.locate.outputs.dir }}
+        run: |
+          set +e
+          gradle -p "$PROJECT_DIR" build --no-daemon --continue --stacktrace 2>&1 | tee build.log
+          echo "gradle exit code: ${PIPESTATUS[0]}"
+          exit 0
+
+      - name: Show the problem in the run summary
+        if: always()
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.locate.outputs.dir }}
+        run: |
+          {
+            echo "### Build result"
+            echo "Project folder: \`$PROJECT_DIR\`"
+            if ls "$PROJECT_DIR"/build/libs/*.jar >/dev/null 2>&1; then
+              echo "Jar built: $(ls "$PROJECT_DIR"/build/libs/*.jar | xargs -n1 basename | tr '\n' ' ')"
+            else
+              echo "No jar was produced. Details below."
+            fi
+            echo
+            echo "**What went wrong:**"
+            echo '```'
+            grep -A8 -m1 "What went wrong" build.log | cut -c1-300 || true
+            echo '```'
+            echo "**Compile errors:**"
+            echo '```'
+            grep -E "error:" build.log | head -80 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload jar
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: realistificator-jar
+          path: ${{ steps.locate.outputs.dir }}/build/libs/*.jar
+          if-no-files-found: ignore
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
